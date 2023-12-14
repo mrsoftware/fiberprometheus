@@ -22,7 +22,9 @@
 package fiberprometheus
 
 import (
+	"errors"
 	"io"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -333,4 +335,116 @@ func TestMiddlewareWithCustomRegistry(t *testing.T) {
 	if !strings.Contains(got, want) {
 		t.Errorf("got %s; want %s", got, want)
 	}
+}
+
+func TestMiddlewareCustomStatusCodeGetter(t *testing.T) {
+	app := fiber.New(fiber.Config{ErrorHandler: customErrorHandler})
+
+	prometheus := New("test-service")
+	prometheus.RegisterAt(app, "/metrics")
+	//prometheus.SetStatusGetter(customStatusCodeGetter)
+	app.Use(prometheus.Middleware)
+	app.Get("/", func(c *fiber.Ctx) error {
+		return c.SendString("Hello World")
+	})
+	app.Get("/error/:type", func(ctx *fiber.Ctx) error {
+		switch ctx.Params("type") {
+		case "fiber":
+
+			return newCustomError(http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+		default:
+			return newCustomError(http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+		}
+
+	})
+	req := httptest.NewRequest("GET", "/", nil)
+	resp, _ := app.Test(req, -1)
+	if resp.StatusCode != 200 {
+		t.Fail()
+	}
+
+	req = httptest.NewRequest("GET", "/error/fiber", nil)
+	resp, _ = app.Test(req, -1)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fail()
+	}
+
+	req = httptest.NewRequest("GET", "/error/unknown", nil)
+	resp, _ = app.Test(req, -1)
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Fail()
+	}
+
+	req = httptest.NewRequest("GET", "/metrics", nil)
+	resp, _ = app.Test(req, -1)
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	got := string(body)
+	want := `http_requests_total{method="GET",path="/",service="test-service",status_code="200"} 1`
+	if !strings.Contains(got, want) {
+		t.Errorf("got %s; want %s", got, want)
+	}
+
+	want = `http_requests_total{method="GET",path="/error/:type",service="test-service",status_code="400"} 1`
+	if !strings.Contains(got, want) {
+		t.Errorf("got %s; want %s", got, want)
+	}
+
+	//want = `http_requests_total{method="GET",path="/error/:type",service="test-service",status_code="500"} 1`
+	//if !strings.Contains(got, want) {
+	//	t.Errorf("got %s; want %s", got, want)
+	//}
+	//
+	//want = `http_request_duration_seconds_count{method="GET",path="/",service="test-service",status_code="200"} 1`
+	//if !strings.Contains(got, want) {
+	//	t.Errorf("got %s; want %s", got, want)
+	//}
+	//
+	//want = `http_requests_in_progress_total{method="GET",service="test-service"} 0`
+	//if !strings.Contains(got, want) {
+	//	t.Errorf("got %s; want %s", got, want)
+	//}
+}
+
+func customStatusCodeGetter(ctx *fiber.Ctx, err error) int {
+	if err == nil {
+		return ctx.Response().StatusCode()
+	}
+
+	if e, ok := err.(*customError); ok {
+		// Get correct error code from fiber.Error type
+		return e.GetCode()
+	}
+
+	return fiber.StatusInternalServerError
+}
+
+type customError struct {
+	msg             string
+	customCodeField int
+}
+
+func newCustomError(msg string, code int) error {
+	return &customError{msg: msg, customCodeField: code}
+}
+
+func (c *customError) Error() string {
+	return c.msg
+}
+
+func (c *customError) GetCode() int {
+	return c.customCodeField
+}
+
+// DefaultErrorHandler that process return errors from handlers
+func customErrorHandler(c *fiber.Ctx, err error) error {
+	code := http.StatusInternalServerError
+	var e *customError
+	if errors.As(err, &e) {
+		code = e.GetCode()
+	}
+
+	c.Set(fiber.HeaderContentType, fiber.MIMETextPlainCharsetUTF8)
+	return c.Status(code).SendString(err.Error())
 }

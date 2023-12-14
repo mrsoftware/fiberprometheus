@@ -32,15 +32,19 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
+// StatusCodeGetter is used if you are using custom error type.
+type StatusCodeGetter func(ctx *fiber.Ctx, err error) (statusCode int)
+
 // FiberPrometheus ...
 type FiberPrometheus struct {
 	requestsTotal   *prometheus.CounterVec
 	requestDuration *prometheus.HistogramVec
 	requestInFlight *prometheus.GaugeVec
 	defaultURL      string
+	getStatusCode   StatusCodeGetter
 }
 
-func create(registry prometheus.Registerer, serviceName, namespace, subsystem string, labels map[string]string) *FiberPrometheus {
+func create(registry prometheus.Registerer, serviceName, namespace, subsystem string, labels map[string]string, statusCodeGetter StatusCodeGetter) *FiberPrometheus {
 	constLabels := make(prometheus.Labels)
 	if serviceName != "" {
 		constLabels["service"] = serviceName
@@ -112,13 +116,14 @@ func create(registry prometheus.Registerer, serviceName, namespace, subsystem st
 		requestDuration: histogram,
 		requestInFlight: gauge,
 		defaultURL:      "/metrics",
+		getStatusCode:   statusCodeGetter,
 	}
 }
 
 // New creates a new instance of FiberPrometheus middleware
 // serviceName is available as a const label
 func New(serviceName string) *FiberPrometheus {
-	return create(prometheus.DefaultRegisterer, serviceName, "http", "", nil)
+	return create(prometheus.DefaultRegisterer, serviceName, "http", "", nil, DefaultStatusCodeGetter)
 }
 
 // NewWith creates a new instance of FiberPrometheus middleware but with an ability
@@ -129,7 +134,7 @@ func New(serviceName string) *FiberPrometheus {
 // For e.g. namespace = "my_app", subsystem = "http" then metrics would be
 // `my_app_http_requests_total{...,service= "serviceName"}`
 func NewWith(serviceName, namespace, subsystem string) *FiberPrometheus {
-	return create(prometheus.DefaultRegisterer, serviceName, namespace, subsystem, nil)
+	return create(prometheus.DefaultRegisterer, serviceName, namespace, subsystem, nil, DefaultStatusCodeGetter)
 }
 
 // NewWithLabels creates a new instance of FiberPrometheus middleware but with an ability
@@ -141,7 +146,7 @@ func NewWith(serviceName, namespace, subsystem string) *FiberPrometheus {
 // then then metrics would become
 // `my_app_http_requests_total{...,key1= "value1", key2= "value2" }`
 func NewWithLabels(labels map[string]string, namespace, subsystem string) *FiberPrometheus {
-	return create(prometheus.DefaultRegisterer, "", namespace, subsystem, labels)
+	return create(prometheus.DefaultRegisterer, "", namespace, subsystem, labels, DefaultStatusCodeGetter)
 }
 
 // NewWithRegistry creates a new instance of FiberPrometheus middleware but with an ability
@@ -153,7 +158,7 @@ func NewWithLabels(labels map[string]string, namespace, subsystem string) *Fiber
 // then then metrics would become
 // `my_app_http_requests_total{...,key1= "value1", key2= "value2" }`
 func NewWithRegistry(registry prometheus.Registerer, serviceName, namespace, subsystem string, labels map[string]string) *FiberPrometheus {
-	return create(registry, serviceName, namespace, subsystem, labels)
+	return create(registry, serviceName, namespace, subsystem, labels, DefaultStatusCodeGetter)
 }
 
 // RegisterAt will register the prometheus handler at a given URL
@@ -180,25 +185,35 @@ func (ps *FiberPrometheus) Middleware(ctx *fiber.Ctx) error {
 	}()
 
 	err := ctx.Next()
-	// initialize with default error code
-	// https://docs.gofiber.io/guide/error-handling
-	status := fiber.StatusInternalServerError
-	if err != nil {
-		if e, ok := err.(*fiber.Error); ok {
-			// Get correct error code from fiber.Error type
-			status = e.Code
-		}
-	} else {
-		status = ctx.Response().StatusCode()
-	}
 
 	path := ctx.Route().Path
 
-	statusCode := strconv.Itoa(status)
+	statusCode := strconv.Itoa(ps.getStatusCode(ctx, err))
 	ps.requestsTotal.WithLabelValues(statusCode, method, path).Inc()
 
 	elapsed := float64(time.Since(start).Nanoseconds()) / 1e9
 	ps.requestDuration.WithLabelValues(statusCode, method, path).Observe(elapsed)
 
 	return err
+}
+
+// SetStatusGetter is used if you would use your own status getter for your custom error type.
+func (ps *FiberPrometheus) SetStatusGetter(getter StatusCodeGetter) {
+	ps.getStatusCode = getter
+}
+
+// DefaultStatusCodeGetter is based on fiber error type.
+func DefaultStatusCodeGetter(ctx *fiber.Ctx, err error) int {
+	if err == nil {
+		return ctx.Response().StatusCode()
+	}
+
+	// initialize with default error code
+	// https://docs.gofiber.io/guide/error-handling
+	if e, ok := err.(*fiber.Error); ok {
+		// Get correct error code from fiber.Error type
+		return e.Code
+	}
+
+	return fiber.StatusInternalServerError
 }
